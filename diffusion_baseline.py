@@ -18,7 +18,7 @@ def load_dataset(path, n=None):
 
 
 class SudokuDiffusion(nn.Module):
-    def __init__(self, vocab_size=11, embed_dim=128, num_heads=4, num_layers=4, seq_len=81):
+    def __init__(self, vocab_size=10, embed_dim=128, num_heads=4, num_layers=4, seq_len=81):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, embed_dim)
         self.pos_embedding = nn.Embedding(seq_len, embed_dim)
@@ -40,107 +40,106 @@ class SudokuDiffusion(nn.Module):
         return self.output(x)
 
 
-def apply_mask_noise(puzzles, solutions, mask_token=10):
-    unknown_mask = (puzzles == 0)
+def apply_uniform_noise(puzzles, solutions):
+    unknown_cell = (puzzles == 0)
     rand_tensors = torch.rand(solutions.shape, device=solutions.device)
     rand_threshold = torch.rand(solutions.shape[0], 1, device=solutions.device).clamp(min=1/81)
-    should_mask = unknown_mask & (rand_tensors < rand_threshold)
+    should_corrupt = unknown_cell & (rand_tensors < rand_threshold)
     corrupted = solutions.clone()
-    corrupted[should_mask] = mask_token
-    return corrupted, should_mask
+    corrupted[should_corrupt] = torch.randint(1, 10, (should_corrupt.sum(),), device=solutions.device)
+    return corrupted, should_corrupt
 
 
 # ── Setup ──────────────────────────────────────────────────────────────────────
 device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
-puzzles, solutions = load_dataset('sudoku.csv', n=500000)
+puzzles, solutions = load_dataset('sudoku.csv', n=100000)
 dataset = TensorDataset(puzzles, solutions)
 loader = DataLoader(dataset, batch_size=64, shuffle=True)
 model = SudokuDiffusion().to(device)
-model.load_state_dict(torch.load('sudoku_diffusion_masked_500k.pth', map_location=device))
-model.eval()
-# total_params = sum(p.numel() for p in model.parameters())
-# print(f"Parameters: {total_params:,}")
-#criterion = nn.CrossEntropyLoss()
-#optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+#model.load_state_dict(torch.load('sudoku_diffusion_masked_500k.pth', map_location=device))
+#model.eval()
+total_params = sum(p.numel() for p in model.parameters())
+print(f"Parameters: {total_params:,}")
+criterion = nn.CrossEntropyLoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
 
 # ── Training ───────────────────────────────────────────────────────────────────
-# num_epochs = 20
-# for epoch in range(num_epochs):
-#     model.train()
-#     total_loss = 0
-#     start = time.time()
-#     for batch_puzzles, batch_solutions in loader:
-#         batch_puzzles = batch_puzzles.to(device)
-#         batch_solutions = batch_solutions.to(device)
-#         optimizer.zero_grad()
-#         corrupted, should_mask = apply_mask_noise(batch_puzzles, batch_solutions)
-#         output = model(corrupted)
-#         loss = criterion(output[should_mask], batch_solutions[should_mask])
-#         loss.backward()
-#         optimizer.step()
-#         total_loss += loss.item()
-#     elapsed = time.time() - start
-#     print(f"Epoch {epoch+1}/{num_epochs} — Loss: {total_loss/len(loader):.4f} — {elapsed:.0f}s")
-
-# torch.save(model.state_dict(), 'sudoku_diffusion_masked_500k.pth')
-# print("Model saved.")
-
-
-
-
-def iterative_inference(puzzle_string, model, device, k=5):
-    # encode — givens fixed, unknowns masked
-    tokens = [10 if c == '0' or c == '.' else int(c) for c in puzzle_string]
-    x = torch.tensor([tokens], dtype=torch.long).to(device)
-    
-    # track which positions are still masked
-    still_masked = torch.tensor([c == 10 for c in tokens])
-    
-    model.eval()
-    with torch.no_grad():
-        while still_masked.any():
-            output = model(x)  # [1, 81, 10]
-            probs = torch.softmax(output[0], dim=-1)  # [81, 10]
-            
-            # confidence = max probability at each position
-            confidence, predicted = probs.max(dim=-1)  # both [81]
-            
-            # only consider still-masked positions
-            confidence[~still_masked] = -1
-            
-            # pick top-k most confident masked positions
-            num_to_unmask = min(k, still_masked.sum().item())
-            topk_positions = confidence.topk(num_to_unmask).indices
-            
-            # unmask them
-            for pos in topk_positions:
-                x[0, pos] = predicted[pos]
-                still_masked[pos] = False
-    
-    return ''.join(str(x[0, i].item()) for i in range(81))
-
-# ── Iterative decoding benchmark ───────────────────────────────────────────────
-import random
-
-# sample 1000 puzzles for benchmarking
-sample_size = 1000
-indices = random.sample(range(len(puzzles)), sample_size)
-sample_puzzles = [''.join(str(c.item()) for c in puzzles[i]) for i in indices]
-sample_solutions = [''.join(str(c.item()) for c in solutions[i]) for i in indices]
-
-for k in [1, 5, 10, 20, 81]:
-    correct = 0
-    total_passes = 0
+num_epochs = 10
+for epoch in range(num_epochs):
+    model.train()
+    total_loss = 0
     start = time.time()
-    for puzzle_str, solution_str in zip(sample_puzzles, sample_solutions):
-        # count unknown cells for pass calculation
-        num_unknown = puzzle_str.count('0')
-        passes = max(1, -(-num_unknown // k))  # ceiling division
-        total_passes += passes
-        result = iterative_inference(puzzle_str, model, device, k=k)
-        if result == solution_str:
-            correct += 1
+    for batch_puzzles, batch_solutions in loader:
+        batch_puzzles = batch_puzzles.to(device)
+        batch_solutions = batch_solutions.to(device)
+        optimizer.zero_grad()
+        corrupted, should_mask = apply_uniform_noise(batch_puzzles, batch_solutions)
+        output = model(corrupted)
+        loss = criterion(output[should_mask], batch_solutions[should_mask])
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
     elapsed = time.time() - start
-    print(f"k={k:3d} — Puzzle accuracy: {correct/sample_size*100:.2f}% — Avg passes: {total_passes/sample_size:.1f} — Time: {elapsed:.1f}s")
+    print(f"Epoch {epoch+1}/{num_epochs} — Loss: {total_loss/len(loader):.4f} — {elapsed:.0f}s")
 
+torch.save(model.state_dict(), 'sudoku_diffusion_uniform_100k.pth')
+print("Model saved.")
+
+
+
+
+# def iterative_inference(puzzle_string, model, device, k=5):
+#     # encode — givens fixed, unknowns masked
+#     tokens = tokens = [torch.randint(1, 10, (1,)).item() if c == '0' or c == '.' else int(c) for c in puzzle_string]s
+#     x = torch.tensor([tokens], dtype=torch.long).to(device)
+    
+#     # track which positions are still masked
+#     still_unresolved = torch.tensor([c == '0' or c == '.' for c in puzzle_string])
+    
+#     model.eval()
+#     with torch.no_grad():
+#         while still_masked.any():
+#             output = model(x)  # [1, 81, 10]
+#             probs = torch.softmax(output[0], dim=-1)  # [81, 10]
+            
+#             # confidence = max probability at each position
+#             confidence, predicted = probs.max(dim=-1)  # both [81]
+            
+#             # only consider still-masked positions
+#             confidence[~still_masked] = -1
+            
+#             # pick top-k most confident masked positions
+#             num_to_unmask = min(k, still_masked.sum().item())
+#             topk_positions = confidence.topk(num_to_unmask).indices
+            
+#             # unmask them
+#             for pos in topk_positions:
+#                 x[0, pos] = predicted[pos]
+#                 still_masked[pos] = False
+    
+#     return ''.join(str(x[0, i].item()) for i in range(81))
+
+# # ── Iterative decoding benchmark ───────────────────────────────────────────────
+# import random
+
+# # sample 1000 puzzles for benchmarking
+# sample_size = 1000
+# indices = random.sample(range(len(puzzles)), sample_size)
+# sample_puzzles = [''.join(str(c.item()) for c in puzzles[i]) for i in indices]
+# sample_solutions = [''.join(str(c.item()) for c in solutions[i]) for i in indices]
+
+# for k in [1, 5, 10, 20, 81]:
+#     correct = 0
+#     total_passes = 0
+#     start = time.time()
+#     for puzzle_str, solution_str in zip(sample_puzzles, sample_solutions):
+#         # count unknown cells for pass calculation
+#         num_unknown = puzzle_str.count('0')
+#         passes = max(1, -(-num_unknown // k))  # ceiling division
+#         total_passes += passes
+#         result = iterative_inference(puzzle_str, model, device, k=k)
+#         if result == solution_str:
+#             correct += 1
+#     elapsed = time.time() - start
+#     print(f"k={k:3d} — Puzzle accuracy: {correct/sample_size*100:.2f}% — Avg passes: {total_passes/sample_size:.1f} — Time: {elapsed:.1f}s")
