@@ -52,11 +52,11 @@ def apply_uniform_noise(puzzles, solutions):
 
 # ── Setup ──────────────────────────────────────────────────────────────────────
 device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
-puzzles, solutions = load_dataset('sudoku.csv', n=100000)
+puzzles, solutions = load_dataset('sudoku.csv', n=500000)
 dataset = TensorDataset(puzzles, solutions)
 loader = DataLoader(dataset, batch_size=64, shuffle=True)
 model = SudokuDiffusion().to(device)
-model.load_state_dict(torch.load('sudoku_diffusion_uniform_100k.pth', map_location=device))
+#model.load_state_dict(torch.load('sudoku_diffusion_uniform_100k.pth', map_location=device))
 #model.eval()
 total_params = sum(p.numel() for p in model.parameters())
 print(f"Parameters: {total_params:,}")
@@ -65,7 +65,7 @@ optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
 
 # ── Training ───────────────────────────────────────────────────────────────────
-num_epochs = 10
+num_epochs = 20
 for epoch in range(num_epochs):
     model.train()
     total_loss = 0
@@ -83,7 +83,7 @@ for epoch in range(num_epochs):
     elapsed = time.time() - start
     print(f"Epoch {epoch+1}/{num_epochs} — Loss: {total_loss/len(loader):.4f} — {elapsed:.0f}s")
 
-torch.save(model.state_dict(), 'sudoku_diffusion_uniform_100k_20ep.pth')
+torch.save(model.state_dict(), 'sudoku_diffusion_uniform_500k.pth')
 print("Model saved.")
 
 
