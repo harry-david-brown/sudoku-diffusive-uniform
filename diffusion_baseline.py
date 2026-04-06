@@ -56,7 +56,7 @@ puzzles, solutions = load_dataset('sudoku.csv', n=100000)
 dataset = TensorDataset(puzzles, solutions)
 loader = DataLoader(dataset, batch_size=64, shuffle=True)
 model = SudokuDiffusion().to(device)
-#model.load_state_dict(torch.load('sudoku_diffusion_masked_500k.pth', map_location=device))
+model.load_state_dict(torch.load('sudoku_diffusion_uniform_100k.pth', map_location=device))
 #model.eval()
 total_params = sum(p.numel() for p in model.parameters())
 print(f"Parameters: {total_params:,}")
@@ -83,42 +83,37 @@ for epoch in range(num_epochs):
     elapsed = time.time() - start
     print(f"Epoch {epoch+1}/{num_epochs} — Loss: {total_loss/len(loader):.4f} — {elapsed:.0f}s")
 
-torch.save(model.state_dict(), 'sudoku_diffusion_uniform_100k.pth')
+torch.save(model.state_dict(), 'sudoku_diffusion_uniform_100k_20ep.pth')
 print("Model saved.")
 
 
 
 
-# def iterative_inference(puzzle_string, model, device, k=5):
-#     # encode — givens fixed, unknowns masked
-#     tokens = tokens = [torch.randint(1, 10, (1,)).item() if c == '0' or c == '.' else int(c) for c in puzzle_string]s
+# def iterative_inference_uniform(puzzle_string, model, device, k=5):
+#     # givens fixed, unknowns initialized as random digits
+#     tokens = [torch.randint(1, 10, (1,)).item() if c == '0' else int(c) for c in puzzle_string]
 #     x = torch.tensor([tokens], dtype=torch.long).to(device)
     
-#     # track which positions are still masked
-#     still_unresolved = torch.tensor([c == '0' or c == '.' for c in puzzle_string])
+#     # track which positions are still unresolved
+#     still_unresolved = torch.tensor([c == '0' for c in puzzle_string])
     
 #     model.eval()
 #     with torch.no_grad():
-#         while still_masked.any():
-#             output = model(x)  # [1, 81, 10]
-#             probs = torch.softmax(output[0], dim=-1)  # [81, 10]
-            
-#             # confidence = max probability at each position
-#             confidence, predicted = probs.max(dim=-1)  # both [81]
-            
-#             # only consider still-masked positions
-#             confidence[~still_masked] = -1
-            
-#             # pick top-k most confident masked positions
-#             num_to_unmask = min(k, still_masked.sum().item())
-#             topk_positions = confidence.topk(num_to_unmask).indices
-            
-#             # unmask them
+#         while still_unresolved.any():
+#             output = model(x)
+#             probs = torch.softmax(output[0], dim=-1)
+#             confidence, predicted = probs.max(dim=-1)
+#             confidence[~still_unresolved] = -1
+#             num_to_resolve = min(k, still_unresolved.sum().item())
+#             topk_positions = confidence.topk(num_to_resolve).indices
 #             for pos in topk_positions:
 #                 x[0, pos] = predicted[pos]
-#                 still_masked[pos] = False
+#                 still_unresolved[pos] = False
     
 #     return ''.join(str(x[0, i].item()) for i in range(81))
+
+
+
 
 # # ── Iterative decoding benchmark ───────────────────────────────────────────────
 # import random
