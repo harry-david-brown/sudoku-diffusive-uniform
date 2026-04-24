@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import pandas as pd
 import time
 from torch.utils.data import TensorDataset, DataLoader
@@ -30,14 +31,17 @@ class SudokuDiffusion(nn.Module):
             batch_first=True
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.output = nn.Linear(embed_dim, 10)
+        self.jump_chain = nn.Linear(embed_dim, 9)
+        self.holding = nn.Linear(embed_dim, 1)
         self.seq_len = seq_len
 
     def forward(self, x):
         positions = torch.arange(self.seq_len, device=x.device).unsqueeze(0)
         x = self.embedding(x) + self.pos_embedding(positions)
         x = self.transformer(x)
-        return self.output(x)
+        jump = self.jump_chain(x)
+        hold = self.holding(x).squeeze(-1)
+        return jump, hold
 
 
 def apply_uniform_noise(puzzles, solutions):
@@ -52,38 +56,66 @@ def apply_uniform_noise(puzzles, solutions):
 
 # ── Setup ──────────────────────────────────────────────────────────────────────
 device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
+print(f"Using device: {device}")
+
 puzzles, solutions = load_dataset('sudoku.csv', n=500000)
 dataset = TensorDataset(puzzles, solutions)
 loader = DataLoader(dataset, batch_size=64, shuffle=True)
+
 model = SudokuDiffusion().to(device)
-#model.load_state_dict(torch.load('sudoku_diffusion_uniform_100k.pth', map_location=device))
-#model.eval()
 total_params = sum(p.numel() for p in model.parameters())
 print(f"Parameters: {total_params:,}")
-criterion = nn.CrossEntropyLoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
 # ── Training ───────────────────────────────────────────────────────────────────
 num_epochs = 20
 for epoch in range(num_epochs):
     model.train()
     total_loss = 0
+    total_jump_loss = 0
+    total_hold_loss = 0
     start = time.time()
+
     for batch_puzzles, batch_solutions in loader:
         batch_puzzles = batch_puzzles.to(device)
         batch_solutions = batch_solutions.to(device)
         optimizer.zero_grad()
-        corrupted, should_mask = apply_uniform_noise(batch_puzzles, batch_solutions)
-        output = model(corrupted)
-        loss = criterion(output[should_mask], batch_solutions[should_mask])
+
+        corrupted, should_corrupt = apply_uniform_noise(batch_puzzles, batch_solutions)
+        jump, hold = model(corrupted)
+
+        # jump chain loss — cross entropy over corrupted positions
+        # shift targets from 1-9 to 0-8
+        jump_loss = F.cross_entropy(
+            jump[should_corrupt],
+            batch_solutions[should_corrupt] - 1
+        )
+
+        # holding distribution loss — IS divergence over unknown cells
+        hold_probs = torch.sigmoid(hold)
+        targets = should_corrupt.float()
+        unknown = (batch_puzzles == 0)
+        a = targets[unknown].clamp(min=1e-6)
+        b = hold_probs[unknown].clamp(min=1e-6)
+        holding_loss = (a / b - torch.log(a / b) - 1).mean()
+
+        loss = jump_loss + holding_loss
         loss.backward()
         optimizer.step()
-        total_loss += loss.item()
-    elapsed = time.time() - start
-    print(f"Epoch {epoch+1}/{num_epochs} — Loss: {total_loss/len(loader):.4f} — {elapsed:.0f}s")
 
-torch.save(model.state_dict(), 'sudoku_diffusion_uniform_500k.pth')
+        total_loss += loss.item()
+        total_jump_loss += jump_loss.item()
+        total_hold_loss += holding_loss.item()
+
+    elapsed = time.time() - start
+    print(f"Epoch {epoch+1}/{num_epochs} — "
+          f"Loss: {total_loss/len(loader):.4f} — "
+          f"Jump: {total_jump_loss/len(loader):.4f} — "
+          f"Hold: {total_hold_loss/len(loader):.4f} — "
+          f"{elapsed:.0f}s")
+
+torch.save(model.state_dict(), 'sudoku_diffusion_gidd_500k.pth')
 print("Model saved.")
 
 
