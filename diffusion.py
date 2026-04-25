@@ -92,11 +92,8 @@ for epoch in range(num_epochs):
             batch_solutions[should_corrupt] - 1
         )
 
-        # holding distribution loss — IS divergence over unknown cells
+        # holding distribution loss — IS divergence over corrupted positions only
         hold_probs = torch.sigmoid(hold)
-        targets = should_corrupt.float()
-        unknown = (batch_puzzles == 0)
-        # holding loss — IS divergence over CORRUPTED positions only
         a = torch.ones(should_corrupt.sum(), device=device).clamp(min=1e-6)
         b = hold_probs[should_corrupt].clamp(min=1e-6)
         holding_loss = (a / b - torch.log(a / b) - 1).mean()
