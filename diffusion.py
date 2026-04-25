@@ -96,8 +96,9 @@ for epoch in range(num_epochs):
         hold_probs = torch.sigmoid(hold)
         targets = should_corrupt.float()
         unknown = (batch_puzzles == 0)
-        a = targets[unknown].clamp(min=1e-6)
-        b = hold_probs[unknown].clamp(min=1e-6)
+        # holding loss — IS divergence over CORRUPTED positions only
+        a = torch.ones(should_corrupt.sum(), device=device).clamp(min=1e-6)
+        b = hold_probs[should_corrupt].clamp(min=1e-6)
         holding_loss = (a / b - torch.log(a / b) - 1).mean()
 
         loss = jump_loss + holding_loss
