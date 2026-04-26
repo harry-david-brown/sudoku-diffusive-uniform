@@ -121,53 +121,40 @@ print("Model saved.")
 
 
 
+# ── Inference Function ───────────────────────────────────────────────────────────────────
+def gidd_inference(puzzle_string, model, device, k=5, corrupt_threshold=0.5):
+    # initialize — givens fixed, unknowns as random digits 1-9
+    tokens = [torch.randint(1, 10, (1,)).item() if c == '0' else int(c) for c in puzzle_string]
+    x = torch.tensor([tokens], dtype=torch.long).to(device)
 
-# def iterative_inference_uniform(puzzle_string, model, device, k=5):
-#     # givens fixed, unknowns initialized as random digits
-#     tokens = [torch.randint(1, 10, (1,)).item() if c == '0' else int(c) for c in puzzle_string]
-#     x = torch.tensor([tokens], dtype=torch.long).to(device)
-    
-#     # track which positions are still unresolved
-#     still_unresolved = torch.tensor([c == '0' for c in puzzle_string])
-    
-#     model.eval()
-#     with torch.no_grad():
-#         while still_unresolved.any():
-#             output = model(x)
-#             probs = torch.softmax(output[0], dim=-1)
-#             confidence, predicted = probs.max(dim=-1)
-#             confidence[~still_unresolved] = -1
-#             num_to_resolve = min(k, still_unresolved.sum().item())
-#             topk_positions = confidence.topk(num_to_resolve).indices
-#             for pos in topk_positions:
-#                 x[0, pos] = predicted[pos]
-#                 still_unresolved[pos] = False
-    
-#     return ''.join(str(x[0, i].item()) for i in range(81))
+    # track which positions are still unresolved
+    still_unresolved = torch.tensor([c == '0' for c in puzzle_string])
 
+    model.eval()
+    with torch.no_grad():
+        max_iters = 200  # safety limit
+        iteration = 0
+        while still_unresolved.any() and iteration < max_iters:
+            jump, hold = model(x)
 
+            # hold scores for unresolved positions
+            hold_probs = torch.sigmoid(hold[0])  # [81]
+            jump_probs = torch.softmax(jump[0], dim=-1)  # [81, 9]
 
+            # mask resolved positions
+            hold_probs_masked = hold_probs.clone()
+            hold_probs_masked[~still_unresolved] = -1
 
-# # ── Iterative decoding benchmark ───────────────────────────────────────────────
-# import random
+            # pick top-k most confidently corrupted unresolved cells
+            num_to_commit = min(k, still_unresolved.sum().item())
+            topk = hold_probs_masked.topk(num_to_commit).indices
 
-# # sample 1000 puzzles for benchmarking
-# sample_size = 1000
-# indices = random.sample(range(len(puzzles)), sample_size)
-# sample_puzzles = [''.join(str(c.item()) for c in puzzles[i]) for i in indices]
-# sample_solutions = [''.join(str(c.item()) for c in solutions[i]) for i in indices]
+            for pos in topk:
+                # predicted digit is argmax of jump chain + 1 (shift back to 1-9)
+                predicted_digit = jump_probs[pos].argmax().item() + 1
+                x[0, pos] = predicted_digit
+                still_unresolved[pos] = False
 
-# for k in [1, 5, 10, 20, 81]:
-#     correct = 0
-#     total_passes = 0
-#     start = time.time()
-#     for puzzle_str, solution_str in zip(sample_puzzles, sample_solutions):
-#         # count unknown cells for pass calculation
-#         num_unknown = puzzle_str.count('0')
-#         passes = max(1, -(-num_unknown // k))  # ceiling division
-#         total_passes += passes
-#         result = iterative_inference(puzzle_str, model, device, k=k)
-#         if result == solution_str:
-#             correct += 1
-#     elapsed = time.time() - start
-#     print(f"k={k:3d} — Puzzle accuracy: {correct/sample_size*100:.2f}% — Avg passes: {total_passes/sample_size:.1f} — Time: {elapsed:.1f}s")
+            iteration += 1
+
+    return ''.join(str(x[0, i].item()) for i in range(81))
