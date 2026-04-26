@@ -92,11 +92,14 @@ for epoch in range(num_epochs):
             batch_solutions[should_corrupt] - 1
         )
 
-        # holding distribution loss — IS divergence over corrupted positions only
+        # holding distribution loss — BCE over all unknown cells
         hold_probs = torch.sigmoid(hold)
-        a = torch.ones(should_corrupt.sum(), device=device).clamp(min=1e-6)
-        b = hold_probs[should_corrupt].clamp(min=1e-6)
-        holding_loss = (a / b - torch.log(a / b) - 1).mean()
+        unknown = (batch_puzzles == 0)
+        targets = should_corrupt.float()
+        holding_loss = F.binary_cross_entropy(
+            hold_probs[unknown],
+            targets[unknown]
+        )
 
         loss = jump_loss + holding_loss
         loss.backward()
