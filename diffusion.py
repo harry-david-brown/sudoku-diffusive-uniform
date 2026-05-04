@@ -7,15 +7,19 @@ from torch.utils.data import TensorDataset, DataLoader
 
 MASK_TOKEN = 10
 
-def load_dataset(path, n=None):
+HARD_DATASET_PATH = '/Users/harry/.cache/huggingface/hub/datasets--imone--sudoku-hard-v2/snapshots/58942f96baeb572ca3127e2a9e9c70f330783d6b/train.csv'
+
+def load_hard_dataset(path, n=None, min_rating=50):
     df = pd.read_csv(path, dtype=str)
-    puzzles = df['quizzes'].tolist()
-    solutions = df['solutions'].tolist()
+    df['rating'] = pd.to_numeric(df['rating'], errors='coerce')
+    df = df[df['rating'] > min_rating].copy()
+    print(f"Hard puzzles available (rating > {min_rating}): {len(df):,}")
     if n:
-        puzzles = puzzles[:n]
-        solutions = solutions[:n]
-    X = torch.tensor([[int(c) for c in p] for p in puzzles], dtype=torch.long)
-    Y = torch.tensor([[int(c) for c in s] for s in solutions], dtype=torch.long)
+        df = df.iloc[:n]
+    puzzles   = df['question'].tolist()
+    solutions = df['answer'].tolist()
+    X = torch.tensor([[0 if c == '.' else int(c) for c in p] for p in puzzles], dtype=torch.long)
+    Y = torch.tensor([[0 if c == '.' else int(c) for c in s] for s in solutions], dtype=torch.long)
     return X, Y
 
 
@@ -69,7 +73,7 @@ def apply_uniform_noise(puzzles, solutions):
 device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
 print(f"Using device: {device}")
 
-puzzles, solutions = load_dataset('sudoku.csv', n=500000)
+puzzles, solutions = load_hard_dataset(HARD_DATASET_PATH, n=500000)
 dataset = TensorDataset(puzzles, solutions)
 loader = DataLoader(dataset, batch_size=64, shuffle=True)
 
@@ -94,7 +98,7 @@ for epoch in range(num_epochs):
         optimizer.zero_grad()
 
         corrupted, should_corrupt = apply_uniform_noise(batch_puzzles, batch_solutions)
-        jump, hold = model(corrupted, use_holding_gate=True)
+        jump, hold = model(corrupted)  # no gate
 
         jump_loss = F.cross_entropy(
             jump[should_corrupt],
@@ -123,7 +127,7 @@ for epoch in range(num_epochs):
           f"Hold: {total_hold/len(loader):.4f} — "
           f"{elapsed:.0f}s")
 
-torch.save(model.state_dict(), 'sudoku_diffusion_gidd_gated.pth')
+torch.save(model.state_dict(), 'sudoku_diffusion_gidd_hard_ungated.pth')
 print("Model saved.")
 
 
