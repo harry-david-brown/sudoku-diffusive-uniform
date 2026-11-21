@@ -1,109 +1,90 @@
-# Sudoku Uniform Diffusion
+# Neural Sudoku solvers
 
-Part of a project comparing autoregressive and diffusion-based approaches to constraint satisfaction problems. Sudoku is the benchmark.
+Small transformers (about 800k parameters) trained to solve Sudoku, as a testbed for one question: what does
+a network need in order to solve constraint problems that require search, not just deduction?
 
----
+Write-ups: [harrydavidbrown.com](https://harrydavidbrown.com).
 
-## What This Is
+## What is here
 
-A discrete uniform diffusion model trained to solve Sudoku puzzles. Instead of masking unknown cells, they are replaced with random digits during training — the model must learn to detect which tokens are wrong and correct them.
-
----
-
-## Architecture
-
-| Component | Value |
-|---|---|
-| Sequence length | 81 tokens (one per cell, row-major) |
-| Input vocabulary | 10 tokens (digits 0–9) |
-| Output vocabulary | 10 tokens (digits 0–9) |
-| Embedding dim | 128 |
-| Attention heads | 4 |
-| Transformer layers | 4 |
-| Feedforward dim | 512 |
-| Attention | Bidirectional — no causal mask |
-| Total parameters | 806,026 |
-
----
-
-## Training
+| | Model | File | Origin |
+|---|---|---|---|
+| **GIDD** | Masked / hybrid discrete diffusion. Fills the grid in rounds, most confident cells first. | `sudoku/gidd.py`, `gidd_sudoku.py` | Port of von Rütte et al., *Generalized Interpolating Discrete Diffusion* (ICML 2025), [reference code](https://github.com/dvruette/gidd) |
+| **Looped** | One 4-layer transformer run many times over, feeding its own predictions back in. | `sudoku/looped.py`, `looped_sudoku.py` | Port of Cheng Lou's [Sotaku](https://github.com/chenglou/sotaku) |
+| Two-head (archived) | An earlier detector-plus-corrector model. Not GIDD; kept for the record. | `legacy/two_head/` | Posts 3–5 |
 
 ```
-Dataset:      Kaggle 1M Sudoku dataset (bryanpark/sudoku)
-              500,000 puzzles used for training
-Noise:        Per-puzzle random corruption of unknown cells
-              Corrupted cells replaced with random digit 1–9
-              Given cells never corrupted
-Epochs:       20
-Batch:        64
-Optimizer:    Adam, lr=1e-3
-Loss:         CrossEntropyLoss on corrupted positions only
-Device:       Apple MPS (M-series Mac)
-Time:         ~9 hours
+sudoku/                 the library
+  data.py               datasets, encoding, difficulty bands
+  metrics.py            scoring
+  gidd.py               noise schedule, model, loss, samplers
+  looped.py             looped transformer
+  checkpoint.py         load any checkpoint as a solver
+gidd_sudoku.py          train / eval / test the GIDD model
+looped_sudoku.py        train / bench / test the looped model
+eval_by_difficulty.py   the standard report: results by difficulty band
+first_error.py          diagnostic: model vs simple deduction rules
+checkpoints/            trained weights
+legacy/                 superseded code and weights
 ```
 
----
+## Data
 
-## Results
+Neither dataset is in the repo.
 
-**Loss curve — 500k/20ep:**
+- **Easy:** Kaggle [1 million Sudoku games](https://www.kaggle.com/datasets/bryanpark/sudoku). Save as `sudoku.csv`.
+  30–36 givens, all solvable by simple deduction.
+- **Hard:** [imone/sudoku-hard-v2](https://huggingface.co/datasets/imone/sudoku-hard-v2) (the same puzzles as
+  `sapientinc/sudoku-extreme`). Each puzzle has a rating: the number of backtracks a solver needs. Save the two
+  files as `hard_train.csv` and `hard_test.csv`, or leave them in the Hugging Face cache.
 
-```
-Epoch 1:  1.1356
-Epoch 5:  0.8585
-Epoch 10: 0.8190
-Epoch 20: 0.7986
-```
+## How results are reported
 
-Compare to masked diffusion 500k/20ep final loss: 0.0213. Uniform diffusion converges far more slowly.
-
-**Easy puzzles (n=1000 sample):**
+"Hard" is not one thing. The hard test file runs from rating 0 to 385, and clue count is not difficulty
+(17-clue puzzles are mostly rating 0). So every model is scored by band:
 
 ```
-One-shot:
-  Cell accuracy:         44.96%
-  Puzzle accuracy:       0.00%
-  Puzzles w/ violations: 1000/1000
-  Avg violations:        25.14
-
-Iterative decoding:
-  k=1  — Accuracy: 0.60% — Avg violations: 15.64
-  k=5  — Accuracy: 0.20% — Avg violations: 16.28
-  k=10 — Accuracy: 0.10% — Avg violations: 17.11
-  k=20 — Accuracy: 0.00% — Avg violations: 19.70
-  k=81 — Accuracy: 0.00% — Avg violations: 25.17
+python eval_by_difficulty.py checkpoints/gidd_pu0_easyhard.pth 500
+python eval_by_difficulty.py checkpoints/looped.pth 500 --iters 128
 ```
 
-**Scaling behavior:**
+Percent of puzzles solved, 500 per band:
+
+| Band | Givens | GIDD, easy-only | GIDD, easy → hard | GIDD, easy → hard, p_u = 0.2 |
+|---|---|---|---|---|
+| Easy Kaggle, rating 0 | 33.8 | 100.0 | 100.0 | 100.0 |
+| Other, rating 0 | 25.5 | 41.6 | 83.4 | 66.6 |
+| 17-clue, rating 0 | 17.0 | 1.8 | 22.2 | 6.6 |
+| Rating 1–5 | 25.6 | 17.0 | 38.8 | 28.2 |
+| Rating 6–20 | 25.0 | 0.8 | 2.0 | 1.2 |
+| Rating 21–50 | 25.0 | 1.0 | 1.2 | 1.8 |
+| Rating 51–100 | 24.8 | 0.6 | 0.6 | 1.2 |
+| Rating > 100 | 24.0 | 0.0 | 1.2 | 0.6 |
+
+The GIDD models stop where simple deduction stops (`first_error.py`). Sotaku's published weights, loaded
+through `sudoku/looped.py`, solve 95–100% of every band at 128 iterations (40 puzzles per band). Those weights
+are included as `checkpoints/external/sotaku_v2.pt` (MIT licence, © Cheng Lou) so the comparison can be rerun:
 
 ```
-100k/10ep:  Cell 43.76%, Puzzle 0.00%
-100k/20ep:  Cell 44.75%, Puzzle 0.00%
-500k/20ep:  Cell 44.96%, Puzzle 0.00%
+python eval_by_difficulty.py checkpoints/external/sotaku_v2.pt 500 --iters 1024
 ```
 
----
-
-## What the Model Learned
-
-Despite zero puzzle accuracy, the model is not outputting random noise. Confidence analysis on unknown cells:
+## Running
 
 ```
-Mean max confidence: 0.5842  (random baseline: 0.1111)
-Min max confidence:  0.2826
-Max max confidence:  0.9684
+pip install -r requirements.txt
+
+python gidd_sudoku.py test          # 21 checks of the GIDD math against the paper
+python looped_sudoku.py test        # checks the Sotaku port
+
+# GIDD: 500k easy puzzles, then fine-tune on hard ones
+python gidd_sudoku.py train --pu 0.0 --out checkpoints/gidd_pu0_easy.pth
+python gidd_sudoku.py train --pu 0.0 --data hard --init checkpoints/gidd_pu0_easy.pth --lr 1e-4 --out checkpoints/gidd_pu0_easyhard.pth
+
+# Looped: size the run first, then train
+python looped_sudoku.py bench
+python looped_sudoku.py train --steps 8000 --batch 128 --out checkpoints/looped.pth
 ```
 
-The model has learned to rule out unlikely digits — near-zero probabilities appear for most positions. It has learned *what is unlikely* better than *what is correct*. This is the first half of the error-detection task; the second half (identifying the correct replacement) requires more compute to emerge.
-
----
-
-## Why It Fails at This Scale
-
-With masked diffusion, a MASK token unambiguously signals "predict something here." With uniform noise, a corrupted cell is indistinguishable from a given cell by appearance alone — the model must infer from global context whether any token is correct or wrong. This requires simultaneously learning two distinct skills:
-
-1. **Error detection** — is this token wrong?
-2. **Error correction** — if wrong, what should it be?
-
-The current single-output-head architecture conflates these tasks, producing a diffuse gradient signal. Von Rütte et al. conjecture that explicitly separating these into two heads, one for the holding distribution (when to change) and one for the jump chain (what to change to), would produce cleaner gradients and faster convergence.
-
+`--pu` is the share of random digits in the diffusion noise; 0 is plain masked diffusion.
+Everything was developed on an Apple Silicon laptop (MPS).
