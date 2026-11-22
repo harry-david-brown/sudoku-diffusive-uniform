@@ -86,5 +86,22 @@ python looped_sudoku.py bench
 python looped_sudoku.py train --steps 8000 --batch 128 --out checkpoints/looped.pth
 ```
 
+### Memory and speed for the looped model
+
+Training runs the network 16 times per puzzle. Ordinary backpropagation keeps all 16 iterations in memory,
+about 130 MB per puzzle, so `--full-memory` only suits small batches (32 uses about 3 GB). By default the
+trainer replays one iteration at a time instead (`backward_low_memory` in `sudoku/looped.py`): about 12 MB
+per puzzle, identical gradients, somewhat more compute per step.
+
+On an NVIDIA card add `--amp` for 16-bit mixed precision:
+
+```
+python looped_sudoku.py bench --amp
+python looped_sudoku.py train --amp --batch 256 --steps 20000 --out checkpoints/looped.pth
+```
+
+`bench` tries several batch sizes and prints puzzles per second for each; run it before committing hours
+to a training run. Evaluation always uses 32-bit arithmetic.
+
 `--pu` is the share of random digits in the diffusion noise; 0 is plain masked diffusion.
 Everything was developed on an Apple Silicon laptop (MPS).

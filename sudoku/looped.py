@@ -8,6 +8,7 @@ This is not a diffusion model: nothing is masked or noised, and no cell is ever 
 Module names match the reference so its published weights load directly (see load_solver in checkpoint.py).
 Reference: stabilize/exp_testbed_20k.py (SudokuTransformer, RoPETransformerLayer).
 """
+import contextlib
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -96,13 +97,19 @@ class LoopedTransformer(nn.Module):
         return all_logits, (h, preds)
 
 
+def autocast(amp):
+    """amp: None for ordinary 32-bit arithmetic, or (device type, dtype) for mixed precision,
+    e.g. ('cuda', torch.float16) on an NVIDIA card."""
+    return torch.autocast(amp[0], dtype=amp[1]) if amp else contextlib.nullcontext()
+
+
 def looped_loss(all_logits, puzzles, solutions):
     """Cross-entropy on the blank cells, averaged over every iteration (deep supervision)."""
     blank = (puzzles == 0).float()
     target = (solutions - 1).reshape(-1)
     loss = 0
     for logits in all_logits:
-        ce = F.cross_entropy(logits.reshape(-1, 9), target, reduction='none').view_as(blank)
+        ce = F.cross_entropy(logits.float().reshape(-1, 9), target, reduction='none').view_as(blank)
         loss = loss + (ce * blank).sum() / blank.sum()
     return loss / len(all_logits)
 
@@ -116,7 +123,7 @@ def solve_looped(model, puzzles, iters=128):
     return torch.where(puzzles != 0, puzzles, logits.argmax(-1) + 1)
 
 
-def backward_low_memory(model, puzzles, solutions, iters=16, state=None, generator=None):
+def backward_low_memory(model, puzzles, solutions, iters=16, state=None, generator=None, amp=None, scale=1.0):
     """Compute the same loss and gradients as looped_loss(...).backward(), holding one iteration in memory
     at a time instead of all of them.
 
@@ -125,7 +132,10 @@ def backward_low_memory(model, puzzles, solutions, iters=16, state=None, generat
     gradients, keeping only each one's small input state. Then they are replayed one at a time from last to
     first; each replay gets the gradient flowing back from the iteration after it and passes its own
     back. Dropout is seeded per iteration so the replay matches the first run.
-    Memory is about a sixteenth; time is roughly a third more. Fills p.grad; returns (loss, last logits)."""
+    Memory is about a sixteenth; time is roughly a third more. Fills p.grad; returns (loss, last logits).
+
+    amp, scale: mixed precision. Gradients are multiplied by `scale` (pass GradScaler.get_scale()) so that
+    16-bit gradients do not underflow; the scaler divides it back out when it steps the optimizer."""
     blank = (puzzles == 0).float(); n_blank = blank.sum(); target = (solutions - 1).reshape(-1)
     params = [p for p in model.parameters() if p.requires_grad]
     seeds = torch.randint(0, 2 ** 31 - 1, (iters,), generator=generator).tolist()
@@ -135,23 +145,26 @@ def backward_low_memory(model, puzzles, solutions, iters=16, state=None, generat
         for i in range(iters):
             inputs.append((h, preds))
             torch.manual_seed(seeds[i])
-            h, logits, preds = model.step(h, preds)
-        last_logits = logits
+            with autocast(amp):
+                h, logits, preds = model.step(h, preds)
+        last_logits = logits.float()
     grads = [torch.zeros_like(p) for p in params]
     g_h = g_p = None; total = 0.0
 
     def accumulate(found):
         for acc, g in zip(grads, found):
             if g is not None:
-                acc += g
+                acc += g.to(acc.dtype)
 
     for i in reversed(range(iters)):
         h_in = inputs[i][0].detach().requires_grad_(True); p_in = inputs[i][1].detach().requires_grad_(True)
         torch.manual_seed(seeds[i])
-        h_out, logits, p_out = model.step(h_in, p_in)
-        ce = F.cross_entropy(logits.reshape(-1, 9), target, reduction='none').view_as(blank)
+        with autocast(amp):
+            h_out, logits, p_out = model.step(h_in, p_in)
+        ce = F.cross_entropy(logits.float().reshape(-1, 9), target, reduction='none').view_as(blank)
         objective = (ce * blank).sum() / n_blank / iters
         total += objective.item()
+        objective = objective * scale
         if g_h is not None:                      # gradient arriving from the iteration after this one
             objective = objective + (h_out * g_h).sum() + (p_out * g_p).sum()
         found = torch.autograd.grad(objective, [h_in, p_in] + params, allow_unused=True)
