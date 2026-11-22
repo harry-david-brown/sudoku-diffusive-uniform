@@ -35,7 +35,7 @@ def cmd_train(a):
     print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, betas=(0.9, 0.95))
     amp = amp_setting(a, device); scaler = LossScaler(amp is not None); params = list(model.parameters())
-    phase = -1; run_loss = run_elbo = run_cells = 0.0; start = time.time(); seen = 0
+    phase = -1; run_loss = run_elbo = run_mask = run_fix = run_keep = 0.0; start = time.time(); seen = 0
     for step in range(a.steps):
         while phase < 0 or step >= pools[phase][0]:
             phase += 1; print(f"— step {step}: pool is now {pools[phase][2]}", flush=True)
@@ -54,15 +54,21 @@ def cmd_train(a):
         if not math.isfinite(loss):
             raise SystemExit(f"loss is {loss} at step {step + 1}: stopping. Try a lower --lr.")
         with torch.no_grad():
-            right = (all_logits[-1].argmax(-1) == x_state) & unknown
-            run_loss += loss; run_elbo += elbo.item(); run_cells += right.sum().item() / unknown.sum().item(); seen += 1
+            # three kinds of unknown cell in the noisy grid: masked, holding a wrong digit, holding the right digit
+            right = all_logits[-1].argmax(-1) == x_state
+            masked = unknown & (z_state == 9); wrong = unknown & (z_state != 9) & (z_state != x_state)
+            kept = unknown & (z_state == x_state)
+            share = lambda sel: (right & sel).sum().item() / max(1, sel.sum().item())
+            run_loss += loss; run_elbo += elbo.item(); seen += 1
+            run_mask += share(masked); run_fix += share(wrong); run_keep += share(kept)
         if (step + 1) % a.log_every == 0 or step + 1 == a.steps:
             el = time.time() - start
             print(f"Step {step + 1}/{a.steps} — Loss: {run_loss / seen:.4f} — ELBO: {run_elbo / seen:.4f} — "
-                  f"clean digit right: {run_cells / seen * 100:.1f}% — {(step + 1) * a.batch / el:.0f} puzzles/s — "
+                  f"masked filled right: {run_mask / seen * 100:.1f}% — wrong digits fixed: {run_fix / seen * 100:.1f}% — "
+                  f"right digits kept: {run_keep / seen * 100:.1f}% — {(step + 1) * a.batch / el:.0f} puzzles/s — "
                   f"{el / 60:.0f} min elapsed, ~{el / (step + 1) * (a.steps - step - 1) / 60:.0f} min left"
                   + (f" — skipped {scaler.skipped}" if scaler.skipped else ""), flush=True)
-            run_loss = run_elbo = run_cells = 0.0; seen = 0
+            run_loss = run_elbo = run_mask = run_fix = run_keep = 0.0; seen = 0
         if (step + 1) % a.save_every == 0 or step + 1 == a.steps:
             torch.save({'model': model.state_dict(), 'step': step + 1, 'kind': 'looped_gidd', 'pu': a.pu,
                         'info': f"looped GIDD p_u={a.pu}, {step + 1}/{a.steps} steps x batch {a.batch}, "
