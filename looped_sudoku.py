@@ -32,11 +32,31 @@ def amp_setting(a, device):
     return ('cuda', torch.float16)
 
 
-def make_scaler(amp):
-    try:
-        return torch.amp.GradScaler('cuda', enabled=amp is not None)
-    except (AttributeError, TypeError):                       # older PyTorch
-        return torch.cuda.amp.GradScaler(enabled=amp is not None)
+class LossScaler:
+    """Loss scaling for 16-bit training. Gradients computed in 16 bits underflow to zero unless the loss is
+    multiplied by a large number first; this multiplies by `scale`, divides the gradients back before the
+    optimizer step, halves the scale and skips the step if anything overflowed, and doubles it again after
+    a long run of clean steps. (PyTorch's GradScaler does the same but requires its own backward call,
+    which the low-memory backward pass does not use.) With enabled=False it is a plain optimizer step."""
+
+    def __init__(self, enabled, init=65536.0, growth_interval=2000):
+        self.enabled, self.scale, self.growth_interval = enabled, (init if enabled else 1.0), growth_interval
+        self.good = self.skipped = 0
+
+    def step(self, opt, params):
+        if not self.enabled:
+            opt.step(); return
+        finite = True
+        for p in params:
+            if p.grad is not None:
+                p.grad.div_(self.scale)
+                finite = finite and bool(torch.isfinite(p.grad).all())
+        if finite:
+            opt.step(); self.good += 1
+            if self.good % self.growth_interval == 0:
+                self.scale *= 2.0
+        else:
+            self.scale /= 2.0; self.good = 0; self.skipped += 1
 
 
 def lr_at(step, total, peak, warmup_frac=0.028, min_ratio=0.01):
@@ -71,7 +91,7 @@ def cmd_train(a):
         model.load_state_dict(torch.load(a.init, map_location=device, weights_only=True)['model'])
     print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, betas=(0.9, 0.95))
-    amp = amp_setting(a, device); scaler = make_scaler(amp)
+    amp = amp_setting(a, device); scaler = LossScaler(amp is not None); params = list(model.parameters())
     horizons = [int(h) for h in a.late_horizons.split(',')]
     phase = -1; run_loss = run_cells = run_solved = 0.0; start = time.time(); seen = 0
     for step in range(a.steps):
@@ -91,10 +111,10 @@ def cmd_train(a):
             with autocast(amp):
                 all_logits, _ = model(p, iters=a.iters, state=state)
             loss = looped_loss(all_logits, p, s)
-            opt.zero_grad(); scaler.scale(loss).backward(); loss, last = loss.item(), all_logits[-1].float()
+            opt.zero_grad(); (loss * scaler.scale).backward(); loss, last = loss.item(), all_logits[-1].float()
         else:
-            loss, last = backward_low_memory(model, p, s, a.iters, state, gen, amp, scaler.get_scale())
-        scaler.step(opt); scaler.update()
+            loss, last = backward_low_memory(model, p, s, a.iters, state, gen, amp, scaler.scale)
+        scaler.step(opt, params)
         if not math.isfinite(loss):
             raise SystemExit(f"loss is {loss} at step {step + 1}: stopping. Try a lower --lr.")
         with torch.no_grad():
@@ -105,7 +125,8 @@ def cmd_train(a):
             el = time.time() - start
             print(f"Step {step + 1}/{a.steps} — Loss: {run_loss / seen:.4f} — train cells: {run_cells / seen * 100:.1f}% — "
                   f"train solved: {run_solved / seen * 100:.1f}% — {(step + 1) * a.batch / el:.0f} puzzles/s — "
-                  f"{el / 60:.0f} min elapsed, ~{el / (step + 1) * (a.steps - step - 1) / 60:.0f} min left", flush=True)
+                  f"{el / 60:.0f} min elapsed, ~{el / (step + 1) * (a.steps - step - 1) / 60:.0f} min left"
+                  + (f" — skipped {scaler.skipped}" if scaler.skipped else ""), flush=True)
             run_loss = run_cells = run_solved = 0.0; seen = 0
         if (step + 1) % a.save_every == 0 or step + 1 == a.steps:
             torch.save({'model': model.state_dict(), 'step': step + 1,
@@ -119,10 +140,11 @@ def cmd_bench(a):
     Each line is printed before its step starts: if one stalls for more than a couple of minutes the
     machine is out of memory and swapping; press Ctrl-C and use the last batch size that finished."""
     device = get_device(); print(f"Using device: {device}", flush=True)
-    amp = amp_setting(a, device); scaler = make_scaler(amp)
+    amp = amp_setting(a, device)
     sizes = [a.batch] if a.batch else [32, 64, 128, 256]
     for batch in sizes:
         model = LoopedTransformer().to(device); opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        scaler = LossScaler(amp is not None); params = list(model.parameters())
         sol = torch.tensor([[(3 * (r % 3) + r // 3 + c) % 9 + 1 for r in range(9) for c in range(9)]] * batch)
         puz = torch.where(torch.rand(batch, 81) < 0.3, sol, torch.zeros_like(sol)).to(device); sol = sol.to(device)
         times = []
@@ -131,10 +153,10 @@ def cmd_bench(a):
             if a.full_memory:
                 with autocast(amp):
                     logits = model(puz, iters=a.iters)[0]
-                loss = looped_loss(logits, puz, sol); opt.zero_grad(); scaler.scale(loss).backward(); loss.item()
+                loss = looped_loss(logits, puz, sol); opt.zero_grad(); (loss * scaler.scale).backward(); loss.item()
             else:
-                backward_low_memory(model, puz, sol, a.iters, amp=amp, scale=scaler.get_scale())
-            scaler.step(opt); scaler.update()
+                backward_low_memory(model, puz, sol, a.iters, amp=amp, scale=scaler.scale)
+            scaler.step(opt, params)
             if device.type == 'cuda':
                 torch.cuda.synchronize()
             dt = time.time() - t0; print(f" {dt:.1f}s", flush=True)
