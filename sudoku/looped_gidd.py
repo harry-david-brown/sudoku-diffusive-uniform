@@ -72,6 +72,23 @@ def looped_gidd_loss(all_logits, x_state, z_state, t, unknown, sched, weighting=
     return loss / len(all_logits), elbo
 
 
+def looped_ce_loss(all_logits, x_state, z_state, unknown):
+    """Plain cross-entropy in place of the GIDD loss, applied after every pass and averaged.
+    Every unknown cell is supervised (masked, holding a wrong digit, or holding the right one), and the
+    sum is divided by the number of cells that need changing (masked or wrong). With p_u = 0 the
+    right-digit cells are trivial copies, so this is the loss of sudoku/looped_diffusion.py: cross-entropy
+    on the masked cells, averaged over the masked cells in the batch. No dependence on the noise level.
+    -> (training loss, cross-entropy of the last pass)"""
+    m = unknown.float(); target = x_state.reshape(-1)
+    denom = (unknown & (z_state != x_state)).float().sum().clamp(min=1)
+    loss = 0
+    for logits in all_logits:
+        ce = F.cross_entropy(logits.float().reshape(-1, N_DIGITS), target, reduction='none').view_as(m)
+        last = (ce * m).sum() / denom
+        loss = loss + last
+    return loss / len(all_logits), last.detach()
+
+
 class Denoiser:
     """Makes a looped model look like gidd.py's one-pass model, model(z, t, given) -> logits, by running
     `iters` passes and returning the last. Lets every sampler in gidd.py be used unchanged."""

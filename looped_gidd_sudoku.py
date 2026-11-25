@@ -2,6 +2,7 @@
 
   python looped_gidd_sudoku.py test
   python looped_gidd_sudoku.py train --pu 0.2 --steps 100000 --batch 128 --lr 1e-3 --amp --out checkpoints/loopgidd_pu02.pth
+  python looped_gidd_sudoku.py train --pu 0.2 --loss ce ...        # plain cross-entropy instead of the GIDD loss
   python eval_by_difficulty.py checkpoints/loopgidd_pu02.pth 500 --sampler loop --iters 64
   python eval_by_difficulty.py checkpoints/loopgidd_pu02.pth 500 --sampler confidence --iters 16 --commit 4
   python eval_by_difficulty.py checkpoints/loopgidd_pu02.pth 500 --sampler ancestral+correct --iters 16
@@ -16,7 +17,7 @@ import torch
 from sudoku.data import HARD_TRAIN_PATH, load_hard
 from sudoku.gidd import HybridSchedule, sample_t, make_noisy
 from sudoku.looped import autocast
-from sudoku.looped_gidd import LoopedGIDD, looped_gidd_loss, solve
+from sudoku.looped_gidd import LoopedGIDD, looped_gidd_loss, looped_ce_loss, solve
 from looped_sudoku import get_device, amp_setting, LossScaler, lr_at, phase_pools
 
 
@@ -25,7 +26,8 @@ def cmd_train(a):
     torch.manual_seed(a.seed); gen = torch.Generator().manual_seed(a.seed)
     P, S, R = load_hard(a.train_file, n=a.pool, min_rating=-1, with_rating=True)
     print(f"Training pool: {len(P):,} puzzles, all ratings   curriculum = {a.curriculum}   "
-          f"{a.steps} steps x batch {a.batch} x {a.iters} passes   p_u = {a.pu}, weighting = {a.weighting}")
+          f"{a.steps} steps x batch {a.batch} x {a.iters} passes   p_u = {a.pu}, "
+          + (f"GIDD loss, weighting = {a.weighting}" if a.loss == 'gidd' else "cross-entropy loss"))
     os.makedirs(os.path.dirname(a.out) or '.', exist_ok=True)
     pools = phase_pools(R, a.steps, a.curriculum)
     sched = HybridSchedule(a.pu)
@@ -48,7 +50,10 @@ def cmd_train(a):
         model.train()
         with autocast(amp):
             all_logits, _ = model(z_tok, t, ~unknown, a.iters)
-        loss, elbo = looped_gidd_loss(all_logits, x_state, z_state, t, unknown, sched, a.weighting)
+        if a.loss == 'gidd':
+            loss, elbo = looped_gidd_loss(all_logits, x_state, z_state, t, unknown, sched, a.weighting)
+        else:                                   # the second number logged is then the last pass's cross-entropy
+            loss, elbo = looped_ce_loss(all_logits, x_state, z_state, unknown)
         opt.zero_grad(); (loss * scaler.scale).backward(); scaler.step(opt, params)
         loss = loss.item()
         if not math.isfinite(loss):
@@ -63,7 +68,7 @@ def cmd_train(a):
             run_mask += share(masked); run_fix += share(wrong); run_keep += share(kept)
         if (step + 1) % a.log_every == 0 or step + 1 == a.steps:
             el = time.time() - start
-            print(f"Step {step + 1}/{a.steps} — Loss: {run_loss / seen:.4f} — ELBO: {run_elbo / seen:.4f} — "
+            print(f"Step {step + 1}/{a.steps} — Loss: {run_loss / seen:.4f} — {'ELBO' if a.loss == 'gidd' else 'last-pass CE'}: {run_elbo / seen:.4f} — "
                   f"masked filled right: {run_mask / seen * 100:.1f}% — wrong digits fixed: {run_fix / seen * 100:.1f}% — "
                   f"right digits kept: {run_keep / seen * 100:.1f}% — {(step + 1) * a.batch / el:.0f} puzzles/s — "
                   f"{el / 60:.0f} min elapsed, ~{el / (step + 1) * (a.steps - step - 1) / 60:.0f} min left"
@@ -71,7 +76,8 @@ def cmd_train(a):
             run_loss = run_elbo = run_mask = run_fix = run_keep = 0.0; seen = 0
         if (step + 1) % a.save_every == 0 or step + 1 == a.steps:
             torch.save({'model': model.state_dict(), 'step': step + 1, 'kind': 'looped_gidd', 'pu': a.pu,
-                        'info': f"looped GIDD p_u={a.pu}, {step + 1}/{a.steps} steps x batch {a.batch}, "
+                        'loss': a.loss,
+                        'info': f"looped GIDD p_u={a.pu}{'' if a.loss == 'gidd' else ', cross-entropy loss'}, {step + 1}/{a.steps} steps x batch {a.batch}, "
                                 f"{a.iters} training passes, curriculum {a.curriculum}"}, a.out)
     print(f"Saved {a.out}")
 
@@ -99,6 +105,16 @@ def cmd_test(a):
         out = solve(m, puz[b], sched, sampler, iters=2, k=8, steps=4)
         ok(f"sampler '{sampler}' fills every cell with a digit and keeps the givens",
            bool(((out >= 1) & (out <= 9)).all()) and bool((out[puz[b] != 0] == puz[b][puz[b] != 0]).all()))
+    lce, _ = looped_ce_loss(lg, xs, zs, unk)
+    ok(f"cross-entropy loss is finite at initialisation ({lce.item():.2f})", math.isfinite(lce.item()) and lce.item() > 1.5)
+    from sudoku.looped import looped_loss
+    zt0, zs0, xs0, unk0 = make_noisy(puz[b], sol[b], tt, HybridSchedule(0.0))
+    lg0 = [torch.randn(6, 81, 9) for _ in range(3)]
+    for l in lg0:                                # make the revealed (right-digit) cells exact copies, as a trained model would
+        l[unk0 & (zs0 == xs0)] = torch.nn.functional.one_hot(xs0[unk0 & (zs0 == xs0)], 9).float() * 50
+    grid = torch.where(zt0 == 10, torch.zeros_like(zt0), zt0)      # the same grids as looped_diffusion.py sees them: 0 = masked
+    a_, b_ = looped_ce_loss(lg0, xs0, zs0, unk0)[0].item(), looped_loss(lg0, grid, sol[b]).item()
+    ok(f"at p_u = 0 the cross-entropy loss equals looped_diffusion.py's loss ({a_:.4f} vs {b_:.4f})", abs(a_ - b_) < 1e-3)
     m0 = LoopedGIDD(); s0 = HybridSchedule(0.0); z0 = make_noisy(puz[:2000], sol[:2000], torch.full((2000,), 0.5), s0)[0]
     ok("p_u = 0 produces no wrong digits (masked diffusion)", bool(((z0 == 10) | (z0 == sol[:2000])).all()))
 
@@ -106,6 +122,7 @@ def cmd_test(a):
 if __name__ == '__main__':
     ap = argparse.ArgumentParser(); sub = ap.add_subparsers(dest='cmd', required=True)
     tr = sub.add_parser('train')
+    tr.add_argument('--loss', default='gidd', choices=['gidd', 'ce'], help="gidd: the paper's ELBO loss; ce: plain cross-entropy (see looped_ce_loss)")
     tr.add_argument('--pu', type=float, default=0.2); tr.add_argument('--weighting', default='dynamic', choices=['dynamic', 'clip', 'elbo'])
     tr.add_argument('--steps', type=int, default=8000); tr.add_argument('--batch', type=int, default=64)
     tr.add_argument('--iters', type=int, default=16); tr.add_argument('--lr', type=float, default=2e-3)
