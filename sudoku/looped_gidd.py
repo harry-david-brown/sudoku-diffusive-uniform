@@ -18,6 +18,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .looped import RoPETransformerLayer, _rope_tables, D_MODEL, N_LAYERS, autocast
+from .metrics import violations
 from .gidd import (MASK, N_DIGITS, N_STATES, T_EPS, HybridSchedule, tokens_to_state, gidd_loss, sample_t,
                    make_noisy, sample_confidence, sample_ancestral, self_correct, _start)
 
@@ -101,19 +102,45 @@ class Denoiser:
 
 
 @torch.no_grad()
-def solve(model, puzzles, sched, sampler='confidence', iters=16, k=4, steps=32):
+def solve(model, puzzles, sched, sampler='confidence', iters=16, k=4, steps=32, stop=None, patience=8):
     """sampler:
       'loop'        one denoising call from the fully masked grid, `iters` passes, read everything off.
                     The looped model's way of solving; no cell is committed and no noise level is stepped.
       'confidence'  commit the k most confident masked cells per call (cannot revise)
       'ancestral'   the paper's sampler, `steps` denoising calls; with p_u > 0 a filled cell can change
       'ancestral+correct'  ancestral, then the paper's self-correction loop
-    Network passes: loop = iters; confidence = iters x ceil(blanks / k); ancestral = iters x (steps + 1)."""
+    Network passes: loop = iters; confidence = iters x ceil(blanks / k); ancestral = iters x (steps + 1).
+
+    stop (loop sampler only): when to freeze a puzzle's answer before the passes run out.
+      None      never; the answer is whatever the last pass says
+      'rules'   as soon as the grid breaks no Sudoku rule (no repeated digit in any row, column or box).
+                For a puzzle with one solution that grid is the solution. This puts a rule checker in the
+                decoder; the network itself is unchanged.
+      'stable'  as soon as the answer has not changed for `patience` passes in a row. Uses no rules."""
     den = Denoiser(model, iters)
     if sampler == 'loop':
         z, given = _start(puzzles)
         t = torch.full((puzzles.shape[0],), 1 - T_EPS, device=puzzles.device)
-        return torch.where(given, puzzles, den(z, t, given).argmax(-1) + 1)
+        if stop is None:
+            return torch.where(given, puzzles, den(z, t, given).argmax(-1) + 1)
+        h, preds = model.start(z, t, given)
+        out = torch.zeros_like(puzzles); frozen = torch.zeros(len(puzzles), dtype=torch.bool, device=puzzles.device)
+        prev = None; same = torch.zeros(len(puzzles), dtype=torch.long, device=puzzles.device)
+        for _ in range(iters):
+            h, logits, preds = model.step(h, preds)
+            ans = torch.where(given, puzzles, logits.float().argmax(-1) + 1)
+            if stop == 'rules':
+                done = violations(ans) == 0
+            else:
+                same = torch.where((ans == prev).all(1), same + 1, torch.zeros_like(same)) if prev is not None else same
+                done = same >= patience
+                prev = ans
+            newly = done & ~frozen
+            out[newly] = ans[newly]; frozen |= newly
+            if bool(frozen.all()):
+                break
+        out[~frozen] = ans[~frozen]
+        return out
     if sampler == 'confidence':
         return sample_confidence(den, puzzles, k)
     z = sample_ancestral(den, puzzles, sched, steps)

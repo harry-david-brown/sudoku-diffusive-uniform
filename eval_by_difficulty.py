@@ -19,10 +19,11 @@ ap.add_argument('--iters', type=int, default=128, help='looped: iterations at te
 ap.add_argument('--commit', type=int, default=0, help='looped: commit this many cells per round of --iters iterations (0 = loop only)')
 ap.add_argument('--batch', type=int, default=250); ap.add_argument('--bands', default='ABCDEFGH')
 ap.add_argument('--sampler', default=None, help='looped GIDD: loop | confidence | ancestral | ancestral+correct')
+ap.add_argument('--stop', default=None, choices=['rules', 'stable'], help='looped GIDD, loop sampler: freeze an answer once it breaks no rule, or once it stops changing')
 a = ap.parse_args()
 
 device = torch.device('mps' if torch.backends.mps.is_available() else 'cuda' if torch.cuda.is_available() else 'cpu')
-solve, info = load_solver(a.ckpt, device, k=a.k, iters=a.iters, commit=a.commit, sampler=a.sampler)
+solve, info = load_solver(a.ckpt, device, k=a.k, iters=a.iters, commit=a.commit, sampler=a.sampler, stop=a.stop)
 print(info)
 df = read_hard(HARD_TEST_PATH)
 df['givens'] = df['question'].str.count(r'[1-9]')

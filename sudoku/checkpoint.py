@@ -5,7 +5,7 @@ from .looped import LoopedTransformer, solve_looped
 from .looped_diffusion import solve_commit
 
 
-def load_solver(path, device='cpu', k=1, iters=128, commit=0, sampler=None):
+def load_solver(path, device='cpu', k=1, iters=128, commit=0, sampler=None, stop=None):
     """-> (solve function, one-line description).
     GIDD checkpoints are decoded with the confidence sampler, k cells per pass.
     Looped checkpoints (ours, or Sotaku's published weights) are run for `iters` iterations; with commit > 0
@@ -17,9 +17,9 @@ def load_solver(path, device='cpu', k=1, iters=128, commit=0, sampler=None):
         from .looped_gidd import LoopedGIDD, solve
         model = LoopedGIDD().to(device); model.load_state_dict(state); model.eval()
         sched = HybridSchedule(ck['pu']); sampler = sampler or ('confidence' if commit else 'loop')
-        how = {'loop': f"{iters} passes, nothing committed",
+        how = {'loop': f"{iters} passes, nothing committed" + (f", stop = {stop}" if stop else ""),
                'confidence': f"commit {commit or 4} cells per call of {iters} passes"}.get(sampler, f"{sampler}, {iters} passes per call")
-        return (lambda p: solve(model, p, sched, sampler, iters=iters, k=commit or 4)), f"{path}: {ck['info']}; {how}"
+        return (lambda p: solve(model, p, sched, sampler, iters=iters, k=commit or 4, stop=stop)), f"{path}: {ck['info']}; {how}"
     if any(key.startswith('initial_encoder') for key in state):
         model = LoopedTransformer().to(device)
         model.load_state_dict(state)

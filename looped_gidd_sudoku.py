@@ -37,6 +37,7 @@ def cmd_train(a):
     print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, betas=(0.9, 0.95))
     amp = amp_setting(a, device); scaler = LossScaler(amp is not None); params = list(model.parameters())
+    horizons = [int(x) for x in a.late_horizons.split(',')]
     phase = -1; run_loss = run_elbo = run_mask = run_fix = run_keep = 0.0; start = time.time(); seen = 0
     for step in range(a.steps):
         while phase < 0 or step >= pools[phase][0]:
@@ -48,8 +49,15 @@ def cmd_train(a):
         for g in opt.param_groups:
             g['lr'] = lr_at(step, a.steps, a.lr)
         model.train()
+        state = None
+        if a.late_prob > 0 and torch.rand(1, generator=gen).item() < a.late_prob:
+            # late start: run some passes without gradients first, so the trained passes begin from a state
+            # deep into the loop and the model learns to hold (or keep improving) an answer it already has
+            with torch.no_grad():
+                with autocast(amp):
+                    _, state = model(z_tok, t, ~unknown, horizons[torch.randint(0, len(horizons), (1,), generator=gen).item()])
         with autocast(amp):
-            all_logits, _ = model(z_tok, t, ~unknown, a.iters)
+            all_logits, _ = model(z_tok, t, ~unknown, a.iters, state=state)
         if a.loss == 'gidd':
             loss, elbo = looped_gidd_loss(all_logits, x_state, z_state, t, unknown, sched, a.weighting)
         else:                                   # the second number logged is then the last pass's cross-entropy
@@ -76,9 +84,9 @@ def cmd_train(a):
             run_loss = run_elbo = run_mask = run_fix = run_keep = 0.0; seen = 0
         if (step + 1) % a.save_every == 0 or step + 1 == a.steps:
             torch.save({'model': model.state_dict(), 'step': step + 1, 'kind': 'looped_gidd', 'pu': a.pu,
-                        'loss': a.loss,
+                        'loss': a.loss, 'late_prob': a.late_prob,
                         'info': f"looped GIDD p_u={a.pu}{'' if a.loss == 'gidd' else ', cross-entropy loss'}, {step + 1}/{a.steps} steps x batch {a.batch}, "
-                                f"{a.iters} training passes, curriculum {a.curriculum}"}, a.out)
+                                f"{a.iters} training passes, curriculum {a.curriculum}" + (f", late starts {a.late_prob}" if a.late_prob else "")}, a.out)
     print(f"Saved {a.out}")
 
 
@@ -115,6 +123,10 @@ def cmd_test(a):
     grid = torch.where(zt0 == 10, torch.zeros_like(zt0), zt0)      # the same grids as looped_diffusion.py sees them: 0 = masked
     a_, b_ = looped_ce_loss(lg0, xs0, zs0, unk0)[0].item(), looped_loss(lg0, grid, sol[b]).item()
     ok(f"at p_u = 0 the cross-entropy loss equals looped_diffusion.py's loss ({a_:.4f} vs {b_:.4f})", abs(a_ - b_) < 1e-3)
+    for stop in ('rules', 'stable'):
+        out = solve(m, puz[b], sched, 'loop', iters=6, stop=stop, patience=2)
+        ok(f"loop sampler with stop = '{stop}' fills every cell and keeps the givens",
+           bool(((out >= 1) & (out <= 9)).all()) and bool((out[puz[b] != 0] == puz[b][puz[b] != 0]).all()))
     m0 = LoopedGIDD(); s0 = HybridSchedule(0.0); z0 = make_noisy(puz[:2000], sol[:2000], torch.full((2000,), 0.5), s0)[0]
     ok("p_u = 0 produces no wrong digits (masked diffusion)", bool(((z0 == 10) | (z0 == sol[:2000])).all()))
 
@@ -129,6 +141,8 @@ if __name__ == '__main__':
     tr.add_argument('--pool', type=int, default=1000000); tr.add_argument('--curriculum', default='reverse', choices=['reverse', 'none'])
     tr.add_argument('--log-every', type=int, default=100); tr.add_argument('--save-every', type=int, default=500)
     tr.add_argument('--train-file', default=HARD_TRAIN_PATH); tr.add_argument('--seed', type=int, default=0); tr.add_argument('--init', default=None)
+    tr.add_argument('--late-prob', type=float, default=0.0, help='share of batches that start from a later pass (0 = off)')
+    tr.add_argument('--late-horizons', default='16,32,64,128', help='how many passes to run first on a late-start batch')
     tr.add_argument('--amp', action='store_true'); tr.add_argument('--out', required=True); tr.set_defaults(fn=cmd_train)
     te = sub.add_parser('test'); te.set_defaults(fn=cmd_test)
     a = ap.parse_args(); a.fn(a)
