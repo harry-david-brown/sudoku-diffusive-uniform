@@ -1,4 +1,5 @@
-"""Does the loop take its own guesses back? Trace a looped GIDD model pass by pass.
+"""Does the loop take its own guesses back? Trace a looped model pass by pass.
+Works on looped GIDD checkpoints and on plain looped checkpoints (looped_sudoku.py, Sotaku's weights).
 
   python loop_trace.py checkpoints/loopgidd_ce_pu02_desktop.pth 200
   python loop_trace.py checkpoints/loopgidd_ce_pu0_desktop.pth 200 --bands EFGH
@@ -27,10 +28,18 @@ a = ap.parse_args()
 
 device = torch.device('mps' if torch.backends.mps.is_available() else 'cuda' if torch.cuda.is_available() else 'cpu')
 ck = torch.load(a.ckpt, map_location=device, weights_only=True)
-if ck.get('kind') != 'looped_gidd':
-    raise SystemExit("loop_trace.py needs a looped GIDD checkpoint (looped_gidd_sudoku.py)")
-model = LoopedGIDD().to(device); model.load_state_dict(ck['model']); model.eval()
-print(f"{a.ckpt}: {ck['info']}; {a.iters} passes, nothing committed; 'early' = pass {a.early}")
+state = ck['model'] if 'model' in ck else ck
+gidd = isinstance(ck, dict) and ck.get('kind') == 'looped_gidd'
+if gidd:
+    model = LoopedGIDD().to(device)
+elif any(key.startswith('initial_encoder') for key in state):
+    from sudoku.looped import LoopedTransformer
+    model = LoopedTransformer().to(device)
+else:
+    raise SystemExit("loop_trace.py needs a looped checkpoint")
+model.load_state_dict(state); model.eval()
+info = ck.get('info', 'looped transformer (external weights)') if 'model' in ck else 'looped transformer (external weights)'
+print(f"{a.ckpt}: {info}; {a.iters} passes, nothing committed; 'early' = pass {a.early}")
 marks = [k for k in (1, 2, 4, 8, 16, 32) if k < a.iters] + [a.iters]
 print(f"{'':26s} solved   right after pass " + " ".join(f"{k:>5d}" for k in marks)
       + "   early errors fixed   early rights lost   changed its mind   still moving")
@@ -47,12 +56,14 @@ with torch.no_grad():
         for i in range(0, len(P), a.batch):
             p, s = P[i:i + a.batch].to(device), S[i:i + a.batch].to(device)
             z, given = _start(p); unk = ~given
-            t = torch.full((len(p),), 1 - T_EPS, device=device)
-            h, preds = model.start(z, t, given)
+            if gidd:
+                h, preds = model.start(z, torch.full((len(p),), 1 - T_EPS, device=device), given)
+            else:
+                h, preds = model.start(p)
             early = late_ref = None; late_moved = torch.zeros_like(unk)
             for k in range(1, a.iters + 1):
                 h, logits, preds = model.step(h, preds)
-                ans = logits.argmax(-1) + 1
+                ans = logits.float().argmax(-1) + 1
                 if k in right_at:
                     right_at[k] += ((ans == s) & unk).sum().item()
                 if k == a.early:
